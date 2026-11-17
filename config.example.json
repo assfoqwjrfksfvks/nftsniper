@@ -1,0 +1,16 @@
+{
+  "bot_token": "",
+  "chat_id": "",
+  "dm_collections": "JingleBells, CandyCane, BerryBox, LolPop, HomemadeCake",
+  "max_model_rarity": 5.0,
+  "max_backdrop_rarity": 5.0,
+  "target_backdrops": "Black, Onyx Black, Midnight",
+  "offer_template": "Привет! Увидел твой подарок {gift}. Готов обсудить покупку — актуально?",
+  "poll_interval": 8.0,
+  "request_interval": 1.0,
+  "rescan_interval": 900.0,
+  "lookback": 50,
+  "scan_batch": 20,
+  "gap_window": 10,
+  "initial_ids": {}
+}

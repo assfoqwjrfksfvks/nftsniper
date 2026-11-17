@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.py[cod]
+config.json
+hunter.sqlite3*
+dm_hunter.log*
+.dm_hunter.lock
