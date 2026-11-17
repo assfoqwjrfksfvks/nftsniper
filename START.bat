@@ -1,5 +1,7 @@
 @echo off
 setlocal
+chcp 65001 >nul
+set "PYTHONUTF8=1"
 cd /d "%~dp0"
 if errorlevel 1 goto failed
 if exist ".venv\Scripts\python.exe" if exist ".venv\pyvenv.cfg" goto check_environment
