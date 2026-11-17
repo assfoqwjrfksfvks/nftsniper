@@ -27,6 +27,7 @@ class Gift:
     symbol: str
     issued: int | None = None
     burned: bool = False
+    owner_status: str = "unknown"
 
 
 class NFTFetchError(Exception):
@@ -99,8 +100,8 @@ def parse_gift_html(html: str, slug: str, number: int) -> Gift | None:
         title = soup.title.get_text(strip=True) if soup.title else ''
         if title == 'Telegram Messenger' and soup.select_one('.tl_main_head'):
             return None
-        # Telegram also returns this shell for KNOWN EXISTING gifts when
-        # throttling public-page reads. It must never mean 'missing'.
+        # The same generic shell can appear for existing and absent gifts.
+        # It does not establish why the card is unavailable.
         page_title = soup.select_one('.tgme_page_title')
         description = soup.select_one('.tgme_page_description')
         if (title == 'Telegram: Collectible Gift' and page_title is not None
@@ -109,6 +110,11 @@ def parse_gift_html(html: str, slug: str, number: int) -> Gift | None:
                 and description.get_text(' ', strip=True) == 'This is a unique collectible gift on Telegram.'):
             raise _GiftPlaceholder(f'{slug} #{number}: HTTP 200, пустая карточка NFT; характеристики недоступны')
         raise NFTFetchError('Telegram вернул неизвестную страницу вместо карточки подарка')
+    deep_link = soup.find('meta', attrs={'property': 'al:ios:url'})
+    if deep_link and deep_link.get('content'):
+        actual = parse_qs(urlparse(deep_link['content']).query).get('slug', [''])[0]
+        if actual and actual.casefold() != f'{slug}-{number}'.casefold():
+            raise NFTFetchError('Telegram вернул карточку другого подарка; владелец не принят')
     cells = {}
     for row in table.find_all('tr'):
         th, td = row.find('th'), row.find('td')
@@ -142,6 +148,7 @@ def parse_gift_html(html: str, slug: str, number: int) -> Gift | None:
         model=model, model_rarity=model_rarity,
         backdrop=backdrop, backdrop_rarity=backdrop_rarity, symbol=symbol,
         issued=issued,
+        owner_status="public" if owner_username else ("no_public_username" if owner is not None else "unavailable"),
     )
 
 
@@ -174,6 +181,7 @@ class NFTClient:
         self._pace_lock = asyncio.Lock()
         self._next_request = 0.0
         self._unavailable: set[tuple[str, int]] = set()
+        self.confirmed_missing: set[tuple[str, int]] = set()
         self._last_notice: dict[str, float] = {}
 
     async def _pace(self):
@@ -196,6 +204,7 @@ class NFTClient:
     async def fetch(self, slug: str, number: int) -> Gift | None:
         if not re.fullmatch(r'[A-Za-z][A-Za-z0-9]{1,63}', slug) or not isinstance(number, int) or isinstance(number, bool) or number < 1:
             raise ValueError('Некорректные коллекция или номер подарка')
+        self.confirmed_missing.discard((slug, number))
         try:
             gift = await self._fetch_page(slug, number)
         except _GiftPlaceholder:
@@ -214,6 +223,10 @@ class NFTClient:
                     self._last_notice[slug] = now
                 return None
         self._unavailable.discard((slug, number))
+        if gift is None:
+            if len(self.confirmed_missing) >= 5000:
+                self.confirmed_missing.clear()
+            self.confirmed_missing.add((slug, number))
         return gift
 
     async def _fetch_page(self, slug: str, number: int) -> Gift | None:

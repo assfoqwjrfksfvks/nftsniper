@@ -97,6 +97,41 @@ class StoreTests(unittest.TestCase):
         with patch("store.time.time", return_value=90000):
             self.assertEqual(self.store.due_gaps("CandyCane"), [])
 
+    def test_owner_status_is_durable_and_updates_without_double_counting(self):
+        with patch('store.time.time',return_value=1000):
+            self.store.record_owner_status('CandyCane',1,'no_public_username')
+            self.store.record_owner_status('CandyCane',1,'no_public_username')
+            self.store.record_owner_status('CandyCane',2,'unavailable')
+            self.assertEqual(self.store.stats()['matched_24h'],2)
+            self.assertEqual(self.store.stats()['owners_without_username'],1)
+        self.store.close();self.store=Store(self.path)
+        with patch('store.time.time',return_value=1010):
+            self.assertEqual(self.store.stats()['owners_without_username'],1)
+            self.store.record_owner_status('CandyCane',1,'public')
+            self.assertEqual(self.store.stats()['owners_without_username'],0)
+            self.assertEqual(self.store.stats()['owners_with_username'],1)
+        with patch('store.time.time',return_value=90000):
+            self.assertEqual(self.store.stats()['matched_24h'],0)
+
+    def test_old_database_adds_owner_counters_without_losing_queue_or_cursor(self):
+        self.enqueue();self.store.set_cursor('CandyCane',42)
+        self.store.db.execute('DROP TABLE owner_checks');self.store.db.commit()
+        self.store.close();self.store=Store(self.path)
+        self.assertEqual(self.store.stats()['pending'],1)
+        self.assertEqual(self.store.get_cursor('CandyCane'),42)
+        self.store.record_owner_status('CandyCane',42,'public')
+        self.assertEqual(self.store.stats()['owners_with_username'],1)
+
+    def test_private_owner_retry_interval_survives_restart(self):
+        with patch('store.time.time',return_value=1000):
+            self.store.add_gap('CandyCane',42)
+            self.store.defer_gap('CandyCane',42,retry_after=1800)
+        self.store.close();self.store=Store(self.path)
+        with patch('store.time.time',return_value=2799):
+            self.assertEqual(self.store.due_gaps('CandyCane'),[])
+        with patch('store.time.time',return_value=2800):
+            self.assertEqual(self.store.due_gaps('CandyCane'),[42])
+
 
 if __name__ == "__main__":
     unittest.main()

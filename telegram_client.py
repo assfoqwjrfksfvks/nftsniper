@@ -36,6 +36,14 @@ def _retry_seconds(value: Any) -> float | None:
     return max(1.0, seconds) if math.isfinite(seconds) and seconds >= 0 else None
 
 
+def _safe_api_description(value, token):
+    text = str(value).replace(token, '[TOKEN]') if token else str(value)
+    text = re.sub(r'https?://[^\s]+', '[URL]', text)
+    text = re.sub(r'\b[0-9]{5,}:[A-Za-z0-9_-]{20,}', '[TOKEN]', text)
+    text = ''.join(c if ord(c) >= 32 and ord(c) != 127 else ' ' for c in text)
+    return ' '.join(text.split())[:300] or 'причина не указана'
+
+
 def control_keyboard() -> dict:
     return {
         "keyboard": [
@@ -97,7 +105,9 @@ class TelegramClient:
                                    'unique gift not found', 'gift does not exist')
                         if any(marker in description for marker in missing):
                             return _GIFT_NOT_FOUND
-                        raise TelegramError('Telegram getUniqueGift: сервер отклонил запрос подарка.', status_code=400)
+                        name = str((payload or {}).get('name', ''))
+                        detail = _safe_api_description(body.get('description', ''), self.token)
+                        raise TelegramError(f'Telegram getUniqueGift({name}): HTTP 400 — {detail}', status_code=400)
                     raise self._api_error(code, retry_after)
                 return body.get("result")
         except TelegramError:

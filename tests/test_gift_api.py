@@ -128,3 +128,80 @@ class APITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(c.exception.retry_after,7)
         import time
         self.assertGreater(source._next_request,time.monotonic()+6)
+
+    async def test_loaded_private_owner_is_not_reported_as_network_failure(self):
+        from nft_client import parse_gift_html
+        raw=(Path(__file__).parent/'fixtures/CandyCane-231888-owner.html').read_text(encoding='utf-8')
+        actual=parse_gift_html(raw,'CandyCane',231888)
+        self.assertIsNone(actual.owner_username)
+        self.assertEqual(actual.owner_status,'no_public_username')
+        bot=AsyncMock();bot.unique_gift.return_value=data(231888)
+        public=AsyncMock();public.fetch.return_value=actual
+        messages=[]
+        source=GiftAPIClient(bot,public,candidate=lambda _:True,log=messages.append,request_interval=0)
+        g=await source.fetch('CandyCane',231888)
+        self.assertEqual(g.owner_status,'no_public_username')
+        self.assertEqual(g.owner_display,'kittiss')
+        self.assertIsNone(g.owner_username)
+        self.assertIn('карточка загружена',' '.join(messages))
+        self.assertNotIn('страница владельца не загружена',' '.join(messages))
+
+    async def test_unclassified_api_400_uses_same_public_card(self):
+        from nft_client import parse_gift_html
+        raw=(Path(__file__).parent/'fixtures/JingleBells-91032-owner.html').read_text(encoding='utf-8')
+        actual=parse_gift_html(raw,'JingleBells',91032)
+        bot=AsyncMock();bot.unique_gift.side_effect=[TelegramError('lookup refused',status_code=400),data(2)]
+        public=AsyncMock();public.fetch.return_value=actual
+        source=GiftAPIClient(bot,public,candidate=lambda _:True,request_interval=0)
+        first=await source.probe('JingleBells',91032)
+        self.assertEqual(first.number,91032)
+        self.assertEqual(first.owner_status,'no_public_username')
+        public.fetch.assert_awaited_once_with('JingleBells',91032)
+        self.assertEqual((await source.probe('CandyCane',2)).number,2)
+
+    async def test_unclassified_400_and_empty_html_do_not_invent_absence(self):
+        bot=AsyncMock();bot.unique_gift.side_effect=TelegramError('lookup refused',status_code=400)
+        public=AsyncMock();public.fetch.return_value=None
+        source=GiftAPIClient(bot,public,candidate=lambda _:True,request_interval=0)
+        with self.assertRaises(NFTFetchError) as e:await source.probe('CandyCane',1)
+        self.assertIn('пустая HTML-карточка',str(e.exception))
+
+    async def test_unclassified_400_and_confirmed_public_absence_can_advance_search(self):
+        bot=AsyncMock();bot.unique_gift.side_effect=TelegramError('lookup refused',status_code=400)
+        public=AsyncMock();public.fetch.return_value=None;public.confirmed_missing={('CandyCane',1)}
+        source=GiftAPIClient(bot,public,candidate=lambda _:True,request_interval=0)
+        self.assertIsNone(await source.probe('CandyCane',1))
+
+    async def test_auth_and_rate_limits_never_use_public_fallback(self):
+        for code in [401,403,404,429]:
+            bot=AsyncMock();bot.unique_gift.side_effect=TelegramError('failed',status_code=code)
+            public=AsyncMock()
+            source=GiftAPIClient(bot,public,candidate=lambda _:True,request_interval=0)
+            with self.assertRaises(NFTFetchError):await source.probe('CandyCane',1)
+            public.fetch.assert_not_awaited()
+
+    async def test_old_public_owner_is_cleared_when_owner_becomes_private(self):
+        from dataclasses import replace
+        old=replace(parse_unique_gift(data(),'CandyCane',1),owner_username='alice_test',owner_status='public')
+        private=replace(old,owner_username=None,owner_status='no_public_username',owner_display='Private')
+        bot=AsyncMock();bot.unique_gift.side_effect=TelegramError('lookup refused',status_code=400)
+        public=AsyncMock();public.fetch.side_effect=[old,private]
+        source=GiftAPIClient(bot,public,candidate=lambda _:True,request_interval=0)
+        await source.probe('CandyCane',1)
+        source._fallback_owner_time[('CandyCane',1)]-=6
+        current=await source.fetch('CandyCane',1)
+        self.assertIsNone(current.owner_username)
+        self.assertEqual(current.owner_status,'no_public_username')
+
+    async def test_detailed_api_rejection_keeps_method_and_gift_but_redacts_token(self):
+        token='12345:'+'x'*24
+        desc=f'Bad Request: UNKNOWN_LOOKUP_ERROR {token} https://api.telegram.org/bot{token}/getUniqueGift\n'
+        c=self.client({'ok':False,'error_code':400,'description':desc},400)
+        with self.assertRaises(TelegramError) as e:await c.unique_gift('CandyCane-1')
+        detail=str(e.exception)
+        self.assertIn('UNKNOWN_LOOKUP_ERROR',detail)
+        self.assertIn('CandyCane-1',detail)
+        self.assertIn('HTTP 400',detail)
+        self.assertNotIn(token,detail)
+        self.assertNotIn('api.telegram.org',detail)
+        self.assertNotIn('\n',detail)

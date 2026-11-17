@@ -46,6 +46,8 @@ class HunterGUI(tk.Tk):
         ttk.Label(self, textvariable=self.status, padding=(14, 2)).pack(fill='x')
         self.positions = tk.StringVar(value='Позиции коллекций появятся после поиска свежих номеров.')
         ttk.Label(self, textvariable=self.positions, padding=(14, 2), wraplength=1100).pack(fill='x')
+        self.contacts = tk.StringVar(value='')
+        ttk.Label(self, textvariable=self.contacts, padding=(14, 2), wraplength=1100).pack(fill='x')
         tabs = ttk.Notebook(self)
         tabs.pack(fill='both', expand=True, padx=14, pady=10)
         finds = ttk.Frame(tabs, padding=8)
@@ -223,6 +225,7 @@ class HunterGUI(tk.Tk):
                 self.running = event['running']
                 self.btn.configure(text='⏹ Остановить мониторинг' if self.running else '▶ Запустить мониторинг')
                 stats = event['stats']
+                self.contacts.set(f"За 24 ч: совпадений {stats.get('matched_24h', 0)} · с username {stats.get('owners_with_username', 0)} · без публичной ссылки {stats.get('owners_without_username', 0)} · страница не загружена {stats.get('owners_unavailable', 0)}")
                 tg = 'бот проверен' if event['telegram'] else 'нет связи / не настроен'
                 self.status.set(f"{'● Работает' if self.running else '○ Остановлен'}   |   Telegram: {tg}   |   "
                                 f"Проверено: {event['checked']}   |   В очереди: {stats['pending']}   |   Доставлено: {stats['sent']}")

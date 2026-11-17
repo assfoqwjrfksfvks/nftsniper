@@ -49,6 +49,10 @@ class ParseTests(unittest.TestCase):
             with self.subTest(html=html), self.assertRaises(NFTFetchError):
                 parse_gift_html(html, 'CandyCane', 1)
 
+    def test_wrong_gift_card_cannot_supply_another_owners_contact(self):
+        html='<meta property="al:ios:url" content="tg://nft?slug=OtherGift-2">'+page()
+        with self.assertRaises(NFTFetchError):parse_gift_html(html,'CandyCane',1)
+
     def test_live_captured_markup(self):
         gift = parse_gift_html((FIXTURES / 'JingleBells-91000.html').read_text(encoding='utf-8'), 'JingleBells', 91000)
         self.assertEqual(gift.model, 'Inner Glow')
@@ -180,6 +184,21 @@ class FetchTests(unittest.IsolatedAsyncioTestCase):
         before=asyncio.get_running_loop().time()
         with self.assertRaises(NFTFetchError): await client.fetch('JingleBells',91000)
         self.assertGreaterEqual(client._next_request,before+59)
+
+    async def test_confirmed_absence_is_not_reused_for_empty_or_failed_page(self):
+        body=(FIXTURES/'JingleBells-136503.html').read_text(encoding='utf-8')
+        session=Session(Response(status=404))
+        client=NFTClient(session,request_interval=0)
+        self.assertIsNone(await client.fetch('CandyCane',1))
+        self.assertIn(('CandyCane',1),client.confirmed_missing)
+        session.response=Response(body=body)
+        self.assertIsNone(await client.fetch('CandyCane',1))
+        self.assertNotIn(('CandyCane',1),client.confirmed_missing)
+        session.response=Response(status=404)
+        await client.fetch('CandyCane',1)
+        session.get=lambda *a,**kw: (_ for _ in ()).throw(asyncio.TimeoutError())
+        with self.assertRaises(NFTFetchError):await client.fetch('CandyCane',1)
+        self.assertNotIn(('CandyCane',1),client.confirmed_missing)
 
     async def test_timeout_is_error(self):
         session=Session(Response())

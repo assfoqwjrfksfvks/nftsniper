@@ -36,6 +36,12 @@ class Store:
                 first_seen_at REAL NOT NULL, next_attempt_at REAL NOT NULL,
                 PRIMARY KEY(slug, number)
             );
+            CREATE TABLE IF NOT EXISTS owner_checks (
+                slug TEXT NOT NULL, number INTEGER NOT NULL,
+                status TEXT NOT NULL, checked_at REAL NOT NULL,
+                PRIMARY KEY(slug, number)
+            );
+            CREATE INDEX IF NOT EXISTS owner_check_time ON owner_checks(checked_at);
             CREATE INDEX IF NOT EXISTS gap_retry ON gaps(slug, next_attempt_at);
             CREATE INDEX IF NOT EXISTS notification_delivery
                 ON notifications(sent_at, next_attempt_at, id);
@@ -85,10 +91,13 @@ class Store:
             WHERE slug=? AND next_attempt_at <= ? ORDER BY next_attempt_at, number LIMIT ?""",
             (slug, now, max(1, min(int(limit), 100)))).fetchall()]
 
-    def defer_gap(self, slug: str, number: int) -> None:
+    def defer_gap(self, slug: str, number: int, retry_after: float = 120) -> None:
+        delay = float(retry_after)
+        if not math.isfinite(delay) or not 1 <= delay <= 86400:
+            raise ValueError('Некорректный интервал перепроверки номера')
         with self.db:
             self.db.execute("UPDATE gaps SET next_attempt_at=? WHERE slug=? AND number=?",
-                            (time.time() + 120, slug, number))
+                            (time.time() + delay, slug, number))
 
     def remove_gap(self, slug: str, number: int) -> None:
         with self.db:
@@ -125,6 +134,16 @@ class Store:
                 next_attempt_at=?, last_error=? WHERE id=? AND sent_at IS NULL""",
                 (time.time() + delay, str(error)[:1000], notification_id))
 
+    def record_owner_status(self, slug: str, number: int, status: str) -> None:
+        if status not in ('public', 'no_public_username', 'unavailable'):
+            raise ValueError('Неизвестный статус владельца')
+        now = time.time()
+        with self.db:
+            self.db.execute('DELETE FROM owner_checks WHERE checked_at < ?', (now - 86400,))
+            self.db.execute("""INSERT INTO owner_checks(slug,number,status,checked_at) VALUES(?,?,?,?)
+                ON CONFLICT(slug,number) DO UPDATE SET status=excluded.status, checked_at=excluded.checked_at""",
+                (slug, number, status, now))
+
     def stats(self) -> dict:
         row = self.db.execute("""SELECT COUNT(*) AS total,
             COALESCE(SUM(sent_at IS NULL),0) AS pending,
@@ -132,6 +151,12 @@ class Store:
             COALESCE(SUM(sent_at IS NULL AND attempts>0),0) AS failed FROM notifications""").fetchone()
         result = dict(row)
         result["seen"] = result["total"]
+        owners = self.db.execute("""SELECT COUNT(*) AS matched_24h,
+            COALESCE(SUM(status='public'),0) AS owners_with_username,
+            COALESCE(SUM(status='no_public_username'),0) AS owners_without_username,
+            COALESCE(SUM(status='unavailable'),0) AS owners_unavailable
+            FROM owner_checks WHERE checked_at >= ?""", (time.time() - 86400,)).fetchone()
+        result.update(dict(owners))
         return result
 
     def recent(self, limit: int = 100) -> list[dict]:

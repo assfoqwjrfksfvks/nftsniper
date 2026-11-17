@@ -184,6 +184,7 @@ class HunterEngine:
                 self._emit('ready', recent=self.store.recent(200))
                 self.log('DM Hunter готов. Мониторинг запускается кнопкой или командой бота.')
                 last_status = 0.0
+                last_report = time.monotonic()
                 try:
                     while not self._closing:
                         try:
@@ -199,6 +200,12 @@ class HunterEngine:
                         if time.monotonic() - last_status >= 2:
                             self._status()
                             last_status = time.monotonic()
+                        if self._scanner and not self._scanner.done() and time.monotonic() - last_report >= 60:
+                            stats = self.store.stats()
+                            self.log(f"Итог: проверок подарков {self._checked}; совпадений за 24 ч {stats['matched_24h']}; "
+                                     f"с username {stats['owners_with_username']}; без публичной ссылки {stats['owners_without_username']}; "
+                                     f"страница не загружена {stats['owners_unavailable']}; очередь {stats['pending']}; доставлено {stats['sent']}.")
+                            last_report = time.monotonic()
                         await asyncio.sleep(0.1)
                 finally:
                     for task in (self._scanner, self._bot, self._outbox):
@@ -347,7 +354,7 @@ class HunterEngine:
                         if gift.owner_username or gift.burned or not match_traits(gift, cfg):
                             self.store.remove_gap(slug, number)
                         else:
-                            self.store.defer_gap(slug, number)
+                            self.store.defer_gap(slug, number, retry_after=1800 if gift.owner_status == 'no_public_username' else 120)
 
                 misses = 0
                 advanced = False
@@ -368,6 +375,8 @@ class HunterEngine:
                         await self._process(gift)
                         if not gift.owner_username and not gift.burned and match_traits(gift, cfg):
                             self.store.add_gap(slug, number)
+                            if gift.owner_status == 'no_public_username':
+                                self.store.defer_gap(slug, number, retry_after=1800)
                         else:
                             self.store.remove_gap(slug, number)
                         misses = 0
@@ -390,6 +399,11 @@ class HunterEngine:
         gift = await self.client.fetch(slug, number)
         if gift:
             self._checked += 1
+            if match_traits(gift, self.cfg):
+                status = 'public' if gift.owner_username else gift.owner_status
+                if status not in ('public', 'no_public_username', 'unavailable'):
+                    status = 'unavailable'
+                self.store.record_owner_status(slug, number, status)
         return gift
 
     async def _process(self, gift):
@@ -489,7 +503,7 @@ class HunterEngine:
                         state = 'работает' if self._scanner and not self._scanner.done() else 'остановлен'
                         positions = ', '.join(f'{s}: #{n}' for s, n in self._positions.items()) or 'поиск границы'
                         problems = '\n'.join(f'{slug}: нет данных' for slug in getattr(self, '_collection_errors', {}))
-                        await bot.send(f'📊 DM Hunter: {state}\nПроверено страниц: {self._checked}\nОчередь: {stats.get("pending", 0)}\nДоставлено: {stats.get("sent", 0)}\n{positions}\n{problems}', control_keyboard())
+                        await bot.send(f'📊 DM Hunter: {state}\nПроверок подарков: {self._checked}\nСовпадений за 24 ч: {stats.get("matched_24h", 0)}\nС username: {stats.get("owners_with_username", 0)}\nБез публичной ссылки: {stats.get("owners_without_username", 0)}\nСтраница не загружена: {stats.get("owners_unavailable", 0)}\nОчередь: {stats.get("pending", 0)}\nДоставлено: {stats.get("sent", 0)}\n{positions}\n{problems}', control_keyboard())
             except TelegramError as exc:
                 self._tg_cooldown = max(self._tg_cooldown, time.monotonic() + float(exc.retry_after or 0))
                 self.log(f'Telegram: {exc}; переподключение…')

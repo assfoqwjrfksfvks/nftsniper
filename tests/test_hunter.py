@@ -273,6 +273,22 @@ class HunterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.get_cursor('CandyCane'), 101)
         self.assertTrue(self.store.has_seen('CandyCane', 101))
 
+    async def test_private_owner_counts_and_retry_schedule_are_saved(self):
+        self.store.set_cursor('CandyCane',100)
+        async def fetch(slug,number):
+            if number==101:return gift(number,owner_username=None,owner_status='no_public_username')
+            raise EndCollection
+        self.engine.client=type('Client',(),{'fetch':staticmethod(fetch)})()
+        with patch('store.time.time',return_value=1000), patch('hunter.discover_latest',new=AsyncMock(return_value=101)), self.assertRaises(EndCollection):
+            await self.engine._collection('CandyCane')
+        row=self.store.db.execute('SELECT next_attempt_at FROM gaps WHERE slug=? AND number=?',('CandyCane',101)).fetchone()
+        self.assertEqual(row['next_attempt_at'],2800)
+        self.assertEqual(self.store.get_cursor('CandyCane'),101)
+        self.assertFalse(self.store.has_seen('CandyCane',101))
+        with patch('store.time.time',return_value=1001):
+            self.assertEqual(self.store.stats()['owners_without_username'],1)
+            self.assertEqual(self.store.stats()['pending'],0)
+
     async def test_collection_crosses_missing_number_and_retains_retry_gap(self):
         self.store.set_cursor('CandyCane', 100)
         self.engine.cfg = replace(self.engine.cfg, scan_batch=5, gap_window=3)
