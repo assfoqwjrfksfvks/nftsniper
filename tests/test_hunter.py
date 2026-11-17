@@ -76,6 +76,26 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(NFTFetchError):
             await discover_latest(client, 'CandyCane', 1)
 
+    async def test_discovery_keeps_confirmed_pages_across_transient_failure(self):
+        client = FakeNFT(last=1200)
+        original = client.fetch
+        failed = False
+        async def fetch(slug, number):
+            nonlocal failed
+            if number == 97 and not failed:
+                failed = True
+                raise NFTFetchError('network unavailable')
+            return await original(slug, number)
+        client.fetch = fetch
+        known = {}
+        with self.assertRaises(NFTFetchError):
+            await discover_latest(client, 'CandyCane', 1, known=known)
+        self.assertIn(1, known)
+        self.assertIn(33, known)
+        self.assertEqual(await discover_latest(client, 'CandyCane', 1, known=known), 1200)
+        self.assertEqual(client.requests.count(1), 1)
+        self.assertEqual(client.requests.count(33), 1)
+
 
 class HunterTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -240,6 +260,18 @@ class HunterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(messages), 3)
         self.assertEqual(offsets, [0, 8])
         self.assertTrue(self.engine._verified)
+
+    async def test_failed_rediscovery_does_not_block_saved_position(self):
+        self.store.set_cursor('CandyCane', 100)
+        async def fetch(slug, number):
+            if number == 101:
+                return gift(number)
+            raise EndCollection
+        self.engine.client = type('Client', (), {'fetch': staticmethod(fetch)})()
+        with patch('hunter.discover_latest', new=AsyncMock(side_effect=NFTFetchError('empty anchor'))), self.assertRaises(EndCollection):
+            await self.engine._collection('CandyCane')
+        self.assertEqual(self.store.get_cursor('CandyCane'), 101)
+        self.assertTrue(self.store.has_seen('CandyCane', 101))
 
     async def test_collection_crosses_missing_number_and_retains_retry_gap(self):
         self.store.set_cursor('CandyCane', 100)

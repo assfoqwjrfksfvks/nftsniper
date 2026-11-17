@@ -61,7 +61,7 @@ class ParseTests(unittest.TestCase):
         self.assertIsNone(parse_gift_html((FIXTURES / 'JingleBells-99999999.html').read_text(encoding='utf-8'), 'JingleBells', 99999999))
         with self.assertRaises(NFTFetchError) as context:
             parse_gift_html((FIXTURES / 'JingleBells-136503.html').read_text(encoding='utf-8'), 'JingleBells', 136503)
-        self.assertEqual(context.exception.retry_after, 60)
+        self.assertIsNone(context.exception.retry_after)
 
 
 class Response:
@@ -121,47 +121,45 @@ class FetchTests(unittest.IsolatedAsyncioTestCase):
         await second
         self.assertGreaterEqual(asyncio.get_running_loop().time()-started,.055)
 
-    async def test_ambiguous_shell_does_not_advance_scanning(self):
+    async def test_empty_shell_retried_without_global_cooldown(self):
         body=(FIXTURES / 'JingleBells-136503.html').read_text(encoding='utf-8')
-        client=NFTClient(Session(Response(body=body)),request_interval=0)
-        before=asyncio.get_running_loop().time()
-        with self.assertRaises(NFTFetchError): await client.fetch('JingleBells',136503)
-        self.assertGreaterEqual(client._next_request, before + 59)
+        session=Session(Response(body=body))
+        client=NFTClient(session,request_interval=0)
+        self.assertIsNone(await client.fetch('JingleBells',136503))
+        self.assertEqual(len(session.requests),2)
+        self.assertEqual(client.request_interval,0)
+        self.assertLess(client._next_request, asyncio.get_running_loop().time()+1)
 
-    async def test_placeholder_means_missing_only_with_healthy_anchor(self):
+    async def test_transient_shell_rechecked_at_same_number(self):
         body=(FIXTURES / 'JingleBells-136503.html').read_text(encoding='utf-8')
         class SequenceSession(Session):
-            def __init__(self): self.responses=iter([Response(),Response(body=body),Response()]);self.requests=[]
+            def __init__(self): self.responses=iter([Response(body=body),Response()]);self.requests=[]
             def get(self,url,**kwargs): self.requests.append((url,kwargs));return next(self.responses)
         session=SequenceSession()
         client=NFTClient(session,request_interval=0)
         self.assertIsNotNone(await client.fetch('JingleBells',91000))
+        self.assertEqual([url.rsplit('-',1)[-1] for url,_ in session.requests],['91000','91000'])
+
+    async def test_one_unavailable_collection_does_not_block_another(self):
+        body=(FIXTURES / 'JingleBells-136503.html').read_text(encoding='utf-8')
+        session=Session(Response(body=body))
+        client=NFTClient(session,request_interval=0)
         self.assertIsNone(await client.fetch('JingleBells',136503))
-        self.assertEqual([url.rsplit('-',1)[-1] for url,_ in session.requests],['91000','136503','91000'])
+        session.response=Response()
+        gift=await asyncio.wait_for(client.fetch('CandyCane',1),timeout=.5)
+        self.assertIsNotNone(gift)
         self.assertEqual(client.request_interval,0)
 
-    async def test_throttled_anchor_stops_progress_and_adapts_rate(self):
+    async def test_explicit_rate_limit_on_shell_retry_is_not_hidden(self):
         body=(FIXTURES / 'JingleBells-136503.html').read_text(encoding='utf-8')
-        session=Session(Response())
-        client=NFTClient(session,request_interval=0)
-        await client.fetch('JingleBells',91000)
-        session.response=Response(body=body)
-        before=asyncio.get_running_loop().time()
+        class SequenceSession(Session):
+            def __init__(self): self.responses=iter([Response(body=body),Response(status=429,headers={'Retry-After':'5'})]);self.requests=[]
+            def get(self,url,**kwargs):self.requests.append((url,kwargs));return next(self.responses)
+        client=NFTClient(SequenceSession(),request_interval=0)
         with self.assertRaises(NFTFetchError) as context:
-            await client.fetch('JingleBells',136503)
-        self.assertEqual(context.exception.retry_after,60)
-        self.assertGreaterEqual(client._next_request,before+59)
-        self.assertEqual(client.request_interval,1)
-        self.assertEqual(len(session.requests),3)
-
-    async def test_same_anchor_shell_is_always_retryable(self):
-        body=(FIXTURES / 'JingleBells-136503.html').read_text(encoding='utf-8')
-        session=Session(Response())
-        client=NFTClient(session,request_interval=0)
-        await client.fetch('JingleBells',91000)
-        session.response=Response(body=body)
-        with self.assertRaises(NFTFetchError): await client.fetch('JingleBells',91000)
-        self.assertEqual(len(session.requests),2)
+            await client.fetch('JingleBells',91000)
+        self.assertEqual(context.exception.retry_after,5)
+        self.assertGreater(client._next_request,asyncio.get_running_loop().time()+4)
 
     async def test_adaptive_rate_has_five_second_cap(self):
         client=NFTClient(Session(Response()),request_interval=4.5)

@@ -226,6 +226,8 @@ class HunterGUI(tk.Tk):
                 tg = 'бот проверен' if event['telegram'] else 'нет связи / не настроен'
                 self.status.set(f"{'● Работает' if self.running else '○ Остановлен'}   |   Telegram: {tg}   |   "
                                 f"Проверено: {event['checked']}   |   В очереди: {stats['pending']}   |   Доставлено: {stats['sent']}")
+                if event.get('collection_errors'):
+                    self.status.set(self.status.get() + f"   |   Нет данных: {len(event['collection_errors'])} коллекций")
                 self.positions.set('  ·  '.join(f'{slug}: #{number}' for slug, number in event['positions'].items())
                                    or 'Позиции коллекций появятся после поиска свежих номеров.')
             elif kind in ('error', 'fatal') and not self.closing:

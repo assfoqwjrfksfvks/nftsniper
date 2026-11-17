@@ -13,6 +13,7 @@ import time
 import aiohttp
 
 from nft_client import Gift, NFTClient, NFTFetchError
+from gift_api import GiftAPIClient
 from settings import Settings
 from store import Store
 from telegram_client import TelegramClient, TelegramError, build_notification, control_keyboard
@@ -22,9 +23,9 @@ SEEDS = {"JingleBells": 91000, "CandyCane": 222000, "BerryBox": 52000,
          "LolPop": 310000, "HomemadeCake": 140000}
 
 
-def match_gift(gift: Gift, cfg: Settings) -> str | None:
+def match_traits(gift: Gift, cfg: Settings) -> str | None:
     """Each configured criterion is an OR trigger. Named backgrounds match exactly."""
-    if not gift.owner_username:
+    if gift.burned:
         return None
     reasons = []
     targets = {s.strip().casefold() for s in cfg.target_backdrops.split(',') if s.strip()}
@@ -37,19 +38,31 @@ def match_gift(gift: Gift, cfg: Settings) -> str | None:
     return '; '.join(reasons) or None
 
 
-async def discover_latest(client: NFTClient, slug: str, seed: int, window: int = 10) -> int:
+def match_gift(gift: Gift, cfg: Settings) -> str | None:
+    return match_traits(gift, cfg) if gift.owner_username else None
+
+
+async def discover_latest(client: NFTClient, slug: str, seed: int, window: int = 10, *, known: dict | None = None, progress=None) -> int:
     """Find a tail using exponential bounds and binary search with a hole window.
 
     Public serials are only a proxy for upgrade time; no timestamp is claimed.
     A run of more than `window` unpublished IDs cannot be ruled out by this API.
     """
-    cache: dict[int, Gift | None] = {}
+    cache: dict[int, Gift | None] = dict(known or {})
+    probes = 0
 
     async def fetch(number):
+        nonlocal probes
         if number not in cache:
             if len(cache) >= 600:
                 raise NFTFetchError(f'{slug}: превышен лимит поиска номера; задайте initial_ids')
-            cache[number] = await client.fetch(slug, number)
+            cache[number] = await getattr(client, 'probe', client.fetch)(slug, number)
+            probes += 1
+            if known is not None and cache[number] is not None:
+                known[number] = cache[number]
+            if progress and (probes == 1 or probes % 10 == 0):
+                available = max((n for n, gift in cache.items() if gift is not None), default=0)
+                progress(f'{slug}: поиск границы, запросов {probes}, проверяю #{number}, доступный номер #{available}.')
         return cache[number]
 
     anchor = None
@@ -58,7 +71,7 @@ async def discover_latest(client: NFTClient, slug: str, seed: int, window: int =
         if anchor is not None:
             break
     if anchor is None:
-        raise NFTFetchError(f'{slug}: не найдены опорные подарки. Проверьте название коллекции и initial_ids')
+        raise NFTFetchError(f'{slug}: нет данных ни по одному опорному номеру (HTTP 200/404). Причина недоступности неизвестна; проверьте https://t.me/nft/{slug}-{seed} в браузере', retry_after=60)
     low = anchor.number
     # Quantity is a useful probe, not a maximum serial or a guaranteed existing ID.
     if anchor.issued and anchor.issued > low:
@@ -114,6 +127,7 @@ class HunterEngine:
         self._closing = False
         self._verified = False
         self._last_error = ''
+        self._collection_errors = {}
         self._positions: dict[str, int] = {}
         self._frontiers: dict[str, int] = {}
         self._tg_cooldown = 0.0
@@ -163,7 +177,7 @@ class HunterEngine:
                 headers={'User-Agent': 'DMHunter/5.0 (public gift monitor)'},
                 trust_env=True,
             ) as self.session:
-                self.client = NFTClient(self.session, log=self.log, request_interval=self.cfg.request_interval)
+                self._configure_source()
                 self._lock = asyncio.Lock()
                 self._outbox = asyncio.create_task(self._supervise('Очередь Telegram', self._deliver_loop))
                 self._restart_bot()
@@ -195,6 +209,17 @@ class HunterEngine:
         finally:
             self.store.close()
 
+    def _configure_source(self):
+        public = NFTClient(self.session, log=self.log, request_interval=self.cfg.request_interval)
+        if self.cfg.bot_token:
+            self.client = GiftAPIClient(self._telegram(), public,
+                candidate=lambda gift: match_traits(gift, self.cfg), log=self.log,
+                request_interval=self.cfg.request_interval)
+            self.log('Источник номеров и характеристик: Telegram Bot API getUniqueGift. HTML — только публичный владелец.')
+        else:
+            self.client = public
+            self.log('Нет токена: ограниченный режим публичных страниц. Для поиска через Bot API настройте токен.')
+
     async def _handle(self, action, cfg=None):
         async with self._lock:
             if cfg is not None:
@@ -204,7 +229,7 @@ class HunterEngine:
                     running = self._scanner is not None and not self._scanner.done()
                     await self._stop_scan(quiet=True)
                     self.cfg = new
-                    self.client.request_interval = new.request_interval
+                    self._configure_source()
                     if old.bot_token != new.bot_token or old.chat_id != new.chat_id:
                         self._verified = False
                         if self._bot:
@@ -260,6 +285,7 @@ class HunterEngine:
         self._status()
 
     async def _scan_all(self):
+        self._discovery_lock = asyncio.Lock()
         tasks = [asyncio.create_task(self._collection(slug)) for slug in self.cfg.collections]
         try:
             await asyncio.gather(*tasks)
@@ -275,12 +301,20 @@ class HunterEngine:
             self._positions[slug] = cursor
         last_discovery = float('-inf')
         failures = 0
+        known = {}
+        if not hasattr(self, '_discovery_lock'):
+            self._discovery_lock = asyncio.Lock()
+        if not hasattr(self, '_collection_errors'):
+            self._collection_errors = {}
         while True:
             try:
                 if cursor is None:
-                    self.log(f'{slug}: ищу свежие номера; первый поиск может занять несколько минут…')
-                    latest = await discover_latest(self.client, slug,
-                        cfg.initial_ids.get(slug, SEEDS.get(slug, 1)), cfg.gap_window)
+                    self.log(f'{slug}: поиск последних доступных номеров; сохранено опорных карточек: {len(known)}.')
+                    async with self._discovery_lock:
+                        latest = await discover_latest(self.client, slug,
+                            cfg.initial_ids.get(slug, SEEDS.get(slug, 1)), cfg.gap_window, known=known, progress=self.log)
+                    known.clear()
+                    self._collection_errors.pop(slug, None)
                     cursor = max(0, latest - cfg.lookback)
                     self.store.set_cursor(slug, cursor)
                     self._frontiers[slug] = latest
@@ -289,7 +323,13 @@ class HunterEngine:
                     last_discovery = time.monotonic()
                 elif time.monotonic() - last_discovery >= cfg.rescan_interval:
                     # Re-probe the frontier; do not jump a saved cursor or discard intervening gifts.
-                    latest = await discover_latest(self.client, slug, max(1, cursor), cfg.gap_window)
+                    try:
+                        async with self._discovery_lock:
+                            latest = await discover_latest(self.client, slug, max(1, cursor), cfg.gap_window, known=known, progress=self.log)
+                        known.clear()
+                    except NFTFetchError as exc:
+                        self.log(f'{slug}: повторный поиск границы отложен: {exc}. Продолжаю обход от #{cursor}.')
+                        latest = cursor
                     self.log(f'{slug}: проверка границы — #{latest}; текущая позиция #{cursor}.')
                     if latest > cursor + cfg.gap_window:
                         # Missing serials ahead must not block later published ones. Schedule all
@@ -304,7 +344,7 @@ class HunterEngine:
                         self.store.defer_gap(slug, number)
                     else:
                         await self._process(gift)
-                        if gift.owner_username:
+                        if gift.owner_username or gift.burned or not match_traits(gift, cfg):
                             self.store.remove_gap(slug, number)
                         else:
                             self.store.defer_gap(slug, number)
@@ -326,7 +366,7 @@ class HunterEngine:
                             break
                     else:
                         await self._process(gift)
-                        if not gift.owner_username:
+                        if not gift.owner_username and not gift.burned and match_traits(gift, cfg):
                             self.store.add_gap(slug, number)
                         else:
                             self.store.remove_gap(slug, number)
@@ -336,8 +376,10 @@ class HunterEngine:
                         self._positions[slug] = cursor
                         advanced = True
                 failures = 0
+                self._collection_errors.pop(slug, None)
                 await asyncio.sleep(0.1 if advanced else cfg.poll_interval)
             except NFTFetchError as exc:
+                self._collection_errors[slug] = str(exc)
                 failures += 1
                 delay = max(float(getattr(exc, 'retry_after', 0) or 0), min(120, 3 * 2 ** min(failures, 5)))
                 self.log(f'{slug}: {exc}. Повтор через {delay:g} с.')
@@ -446,7 +488,8 @@ class HunterEngine:
                         stats = self.store.stats()
                         state = 'работает' if self._scanner and not self._scanner.done() else 'остановлен'
                         positions = ', '.join(f'{s}: #{n}' for s, n in self._positions.items()) or 'поиск границы'
-                        await bot.send(f'📊 DM Hunter: {state}\nПроверено страниц: {self._checked}\nОчередь: {stats.get("pending", 0)}\nДоставлено: {stats.get("sent", 0)}\n{positions}', control_keyboard())
+                        problems = '\n'.join(f'{slug}: нет данных' for slug in getattr(self, '_collection_errors', {}))
+                        await bot.send(f'📊 DM Hunter: {state}\nПроверено страниц: {self._checked}\nОчередь: {stats.get("pending", 0)}\nДоставлено: {stats.get("sent", 0)}\n{positions}\n{problems}', control_keyboard())
             except TelegramError as exc:
                 self._tg_cooldown = max(self._tg_cooldown, time.monotonic() + float(exc.retry_after or 0))
                 self.log(f'Telegram: {exc}; переподключение…')
@@ -460,5 +503,5 @@ class HunterEngine:
             return
         self._emit('status', running=bool(self._scanner and not self._scanner.done()),
                    telegram=self._verified, positions=dict(self._positions), checked=self._checked,
-                   stats=self.store.stats(), error=self._last_error)
+                   stats=self.store.stats(), error=self._last_error, collection_errors=dict(getattr(self, '_collection_errors', {})))
 

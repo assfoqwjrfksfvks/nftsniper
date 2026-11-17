@@ -15,6 +15,9 @@ from urllib.parse import quote, urlencode
 import aiohttp
 
 
+_GIFT_NOT_FOUND = object()
+
+
 class TelegramError(Exception):
     """Safe to log: no URLs, credentials or raw transport exceptions."""
 
@@ -87,6 +90,14 @@ class TelegramClient:
                     code = body.get("error_code", response.status)
                     if not isinstance(code, int) or code == 200:
                         code = response.status if response.status != 200 else 400
+                    if method == 'getUniqueGift' and code == 400:
+                        description = str(body.get('description', '')).casefold()
+                        missing = ('gift not found', 'gift is not found', 'gift_not_found',
+                                   'gift_slug_invalid', 'gift name is invalid', 'gift_name_invalid',
+                                   'unique gift not found', 'gift does not exist')
+                        if any(marker in description for marker in missing):
+                            return _GIFT_NOT_FOUND
+                        raise TelegramError('Telegram getUniqueGift: сервер отклонил запрос подарка.', status_code=400)
                     raise self._api_error(code, retry_after)
                 return body.get("result")
         except TelegramError:
@@ -128,6 +139,16 @@ class TelegramClient:
         result = await self._request("getMe")
         if not isinstance(result, dict) or not result.get("is_bot"):
             raise TelegramError("Telegram: Bot Token не соответствует боту.")
+        return result
+
+    async def unique_gift(self, name: str) -> dict | None:
+        if not re.fullmatch(r'[A-Za-z][A-Za-z0-9]{1,63}-[1-9][0-9]*', name):
+            raise ValueError('Некорректное имя уникального подарка')
+        result = await self._request('getUniqueGift', {'name': name})
+        if result is _GIFT_NOT_FOUND:
+            return None
+        if not isinstance(result, dict):
+            raise TelegramError('Telegram getUniqueGift: неверный формат ответа.')
         return result
 
     async def answer_callback(self, callback_id: str, text: str = "") -> None:

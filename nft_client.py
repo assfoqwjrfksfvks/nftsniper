@@ -26,6 +26,7 @@ class Gift:
     backdrop_rarity: float
     symbol: str
     issued: int | None = None
+    burned: bool = False
 
 
 class NFTFetchError(Exception):
@@ -37,7 +38,7 @@ class NFTFetchError(Exception):
 
 
 class _GiftPlaceholder(NFTFetchError):
-    """A generic NFT preview can mean either an unavailable gift or throttling."""
+    """HTTP 200 generic NFT preview; no reliable claim about the cause."""
 
 
 _RARITY = re.compile(r"(\d+(?:[.,]\d+)?)\s*([%‰])")
@@ -106,7 +107,7 @@ def parse_gift_html(html: str, slug: str, number: int) -> Gift | None:
                 and page_title.get_text(' ', strip=True) == 'Collectible Gift'
                 and description is not None
                 and description.get_text(' ', strip=True) == 'This is a unique collectible gift on Telegram.'):
-            raise _GiftPlaceholder('Telegram временно скрыл карточку подарка; пауза перед повтором', retry_after=60)
+            raise _GiftPlaceholder(f'{slug} #{number}: HTTP 200, пустая карточка NFT; характеристики недоступны')
         raise NFTFetchError('Telegram вернул неизвестную страницу вместо карточки подарка')
     cells = {}
     for row in table.find_all('tr'):
@@ -161,12 +162,10 @@ def _retry_after(value: str | None, fallback: float = 30) -> float:
 
 
 class NFTClient:
-    """Paced public-page reader with a shared cooldown and per-collection anchor.
+    """Paced reader. Only explicit HTTP failures impose a shared cooldown.
 
-    A generic NFT preview is ambiguous. It becomes an unavailable serial only
-    when a second, paced request still obtains a real table for an earlier valid
-    gift in that collection. Otherwise every collection backs off and polling
-    slows. The scanner must retain unavailable serials for later gap retries.
+    A generic HTTP 200 shell is rechecked once, then recorded as unavailable.
+    It is not proof of throttling or permanent absence; the scanner retains gaps.
     """
     def __init__(self, session: aiohttp.ClientSession, log=lambda _: None, request_interval: float = 1.0):
         self.session = session
@@ -174,7 +173,8 @@ class NFTClient:
         self.request_interval = max(0.0, float(request_interval))
         self._pace_lock = asyncio.Lock()
         self._next_request = 0.0
-        self._anchors: dict[str, int] = {}
+        self._unavailable: set[tuple[str, int]] = set()
+        self._last_notice: dict[str, float] = {}
 
     async def _pace(self):
         async with self._pace_lock:
@@ -198,28 +198,22 @@ class NFTClient:
             raise ValueError('Некорректные коллекция или номер подарка')
         try:
             gift = await self._fetch_page(slug, number)
-        except _GiftPlaceholder as exc:
-            anchor = self._anchors.get(slug)
-            if anchor is None or anchor == number:
-                self._cooldown(adaptive=True)
-                raise
-            # The public site serves the same shell for unavailable serials AND
-            # for throttled valid gifts. A paced probe of a previously valid
-            # gift distinguishes those cases without recursively calling fetch.
+        except _GiftPlaceholder:
+            # Telegram sometimes serves this template for real serials too.
+            # Retry this exact request once, without probing unrelated gifts or
+            # treating an unavailable anchor as a global server rate limit.
             try:
-                healthy = await self._fetch_page(slug, anchor)
-            except NFTFetchError as health_error:
-                delay = max(60, float(health_error.retry_after or 0))
-                self._cooldown(delay, adaptive=True)
-                raise NFTFetchError('Telegram временно не отдаёт даже проверенную карточку; пауза перед повтором', delay) from health_error
-            if healthy is None:
-                self._cooldown(adaptive=True)
-                raise NFTFetchError('Telegram перестал отдавать проверенную карточку; пауза перед повтором', 60) from exc
-            # Healthy anchor + generic requested preview: unavailable for now.
-            # The caller retains this number in the durable gap retry queue.
-            return None
-        if gift is not None:
-            self._anchors[slug] = number
+                gift = await self._fetch_page(slug, number)
+            except _GiftPlaceholder:
+                if len(self._unavailable) >= 5000:
+                    self._unavailable.clear()
+                self._unavailable.add((slug, number))
+                now = asyncio.get_running_loop().time()
+                if now - self._last_notice.get(slug, float('-inf')) >= 60:
+                    self.log(f'{slug} #{number}: HTTP 200, пустая карточка; номер будет перепроверен.')
+                    self._last_notice[slug] = now
+                return None
+        self._unavailable.discard((slug, number))
         return gift
 
     async def _fetch_page(self, slug: str, number: int) -> Gift | None:
@@ -231,12 +225,12 @@ class NFTClient:
                     return None
                 if response.status == 429:
                     retry_after = _retry_after(response.headers.get('Retry-After'))
-                    self._cooldown(retry_after)
+                    self._cooldown(retry_after, adaptive=True)
                     raise NFTFetchError('Telegram ограничил частоту запросов (HTTP 429)', retry_after)
                 if response.status != 200:
                     retry_after = 60 if response.status == 403 else None
                     if retry_after:
-                        self._cooldown(retry_after)
+                        self._cooldown(retry_after, adaptive=True)
                     raise NFTFetchError(f'Ошибка страницы Telegram: HTTP {response.status}', retry_after)
                 # Redirects must remain on Telegram's own public sites.
                 final = urlparse(str(response.url))
